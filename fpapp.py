@@ -30,14 +30,13 @@ st.markdown(
 @st.cache_resource
 def get_reader():
     import os
-    # 使用容器内的可写目录缓存模型，避免每次重新下载
-    model_cache_dir = os.path.join(os.path.expanduser("~"), ".EasyOCR", "model")
-    os.makedirs(model_cache_dir, exist_ok=True)
+    # 使用仓库根目录下的 model 文件夹
+    model_dir = os.path.join(os.path.dirname(__file__), 'model')
     return easyocr.Reader(
         ['ch_sim', 'en'],
         gpu=False,
-        model_storage_directory=model_cache_dir,
-        download_enabled=True  # 允许在线下载（仅首次）
+        model_storage_directory=model_dir,
+        download_enabled=False   # 禁止在线下载，直接使用本地模型
     )
 
 # -------------------------- 图像预处理 --------------------------
