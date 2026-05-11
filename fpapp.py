@@ -22,11 +22,64 @@ st.set_page_config(page_title="JENNY 发票识别", page_icon="📄", layout="wi
 
 SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".pdf"}
 UPLOAD_TYPES = ["png", "jpg", "jpeg", "pdf", "bmp", "tiff", "tif", "zip"]
-INVOICE_FIELDS = ["发票号码", "开票日期", "金额", "销售方"]
-RESULT_REQUIRED_FIELDS = ["发票号码", "开票日期", "金额（元）", "销售方"]
+PARTY_FIELDS = ["名称", "纳税人识别号", "地址电话", "开户行及账号"]
+ITEM_FIELDS = ["项目名称", "规格型号", "单位", "数量", "单价", "金额", "税率", "税额"]
+INVOICE_FIELDS = [
+    "发票号码",
+    "开票日期",
+    "购买方名称",
+    "购买方纳税人识别号",
+    "销售方名称",
+    "销售方纳税人识别号",
+    "价税合计",
+]
+RESULT_REQUIRED_FIELDS = ["发票号码", "开票日期", "销售方名称", "价税合计"]
+RESULT_COLUMNS = [
+    "发票号码",
+    "开票日期",
+    "购买方名称",
+    "购买方纳税人识别号",
+    "购买方地址电话",
+    "购买方开户行及账号",
+    "销售方名称",
+    "销售方纳税人识别号",
+    "销售方地址电话",
+    "销售方开户行及账号",
+    "项目名称",
+    "规格型号",
+    "单位",
+    "数量",
+    "单价",
+    "金额",
+    "税率",
+    "税额",
+    "价税合计",
+]
 MAX_ZIP_FILES = 300
 MAX_ZIP_TOTAL_SIZE = 800 * 1024 * 1024
-MAX_PDF_PAGES = 8
+OCR_PROFILES = {
+    "快速": {
+        "max_width": 900,
+        "pdf_dpi": 150,
+        "max_pdf_pages": 1,
+        "canvas_size": 1280,
+        "mag_ratio": 0.9,
+    },
+    "均衡": {
+        "max_width": 1200,
+        "pdf_dpi": 180,
+        "max_pdf_pages": 3,
+        "canvas_size": 1800,
+        "mag_ratio": 1.0,
+    },
+    "高精度": {
+        "max_width": 1600,
+        "pdf_dpi": 220,
+        "max_pdf_pages": 8,
+        "canvas_size": 2560,
+        "mag_ratio": 1.1,
+    },
+}
 
 
 def apply_custom_styles():
@@ -226,6 +279,14 @@ def clean_extracted_value(value):
     return value.strip(" :：,，.;；")
 
 
+def normalize_item_line(value):
+    value = unicodedata.normalize("NFKC", value or "")
+    value = re.sub(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202f]", " ", value)
+    value = re.sub(r"[|｜]+", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip(" :：,，.;；")
+
+
 def parse_invoice_date(text):
     patterns = [
         r"(\d{4})\s*[年\-/\.]\s*(\d{1,2})\s*[月\-/\.]\s*(\d{1,2})\s*日?",
@@ -302,66 +363,269 @@ def trim_company_name(value):
     return clean_name(value, 60) if value else ""
 
 
-def parse_seller(text):
+def parse_party_section(text, party_keywords, stop_keywords):
     compact_lines = [clean_extracted_value(line) for line in text.splitlines() if line.strip()]
     compact_text = "\n".join(compact_lines)
-
-    seller_section = re.search(
-        r"(?:销售方|销货方|收款方|销售单位)(.{0,220})",
+    start_pattern = "|".join(party_keywords)
+    stop_pattern = "|".join(stop_keywords)
+    match = re.search(
+        rf"(?:{start_pattern})(.*?)(?=(?:{stop_pattern})|$)",
         compact_text,
         re.DOTALL,
     )
-    if seller_section:
-        section = seller_section.group(1)
-        match = re.search(r"(?:名称|名\s*称)[:：]?([^\n]{2,80})", section)
-        if not match:
-            match = re.search(
-                r"([^\n]{2,80}?(?:有限责任公司|股份有限公司|有限公司|公司|事务所|集团|中心|厂|店))",
-                section,
-            )
-        if match:
-            seller = trim_company_name(match.group(1))
-            if seller:
-                return seller
+    return match.group(1) if match else ""
 
-    name_matches = re.findall(r"(?:名称|名\s*称)[:：]?([^\n]{2,80})", compact_text)
-    candidates = [trim_company_name(item) for item in name_matches]
-    candidates = [item for item in candidates if item]
-    if len(candidates) >= 2:
-        return candidates[-1]
-    if candidates:
-        return candidates[0]
+
+def parse_labeled_value(section, label_patterns, max_len=120):
+    section_lines = [line for line in section.splitlines() if line.strip()]
+    for label in label_patterns:
+        match = re.search(rf"(?:{label})[:：]?([^\n]{{2,{max_len}}})", section)
+        if match:
+            return clean_extracted_value(match.group(1))
+        for index, line in enumerate(section_lines):
+            if re.search(label, line):
+                value = clean_extracted_value(re.sub(label, "", line, count=1))
+                if len(value) >= 2:
+                    return value[:max_len]
+                if index + 1 < len(section_lines):
+                    return clean_extracted_value(section_lines[index + 1])[:max_len]
     return ""
 
 
+def parse_party_info(text, role):
+    if role == "购买方":
+        section = parse_party_section(
+            text,
+            ["购买方", "购货方", "付款方"],
+            ["销售方", "销货方", "收款方", "项目名称", "货物或应税劳务"],
+        )
+    else:
+        section = parse_party_section(
+            text,
+            ["销售方", "销货方", "收款方", "销售单位"],
+            ["备注", "收款人", "复核", "开票人", "价税合计"],
+        )
+
+    name = parse_labeled_value(section, [r"名称", r"名\s*称"], 90)
+    if not name:
+        company_match = re.search(
+            r"([^\n]{2,90}?(?:有限责任公司|股份有限公司|有限公司|公司|事务所|集团|中心|厂|店))",
+            section,
+        )
+        if company_match:
+            name = company_match.group(1)
+
+    tax_id = parse_labeled_value(
+        section,
+        [r"纳税人识别号", r"统一社会信用代码", r"税号", r"识别号"],
+        80,
+    )
+    if not tax_id:
+        tax_match = re.search(r"\b([0-9A-Z]{15,20})\b", clean_extracted_value(section))
+        tax_id = tax_match.group(1) if tax_match else ""
+
+    address_phone = parse_labeled_value(section, [r"地址、电话", r"地址电话", r"地址"], 120)
+    bank_account = parse_labeled_value(
+        section,
+        [r"开户行及账号", r"开户行及帐号", r"开户银行及账号", r"开户行账号"],
+        120,
+    )
+
+    return {
+        f"{role}名称": trim_company_name(name),
+        f"{role}纳税人识别号": clean_name(tax_id, 30) if tax_id else "",
+        f"{role}地址电话": address_phone,
+        f"{role}开户行及账号": bank_account,
+    }
+
+
+def parse_seller(text):
+    return parse_party_info(text, "销售方").get("销售方名称", "")
+
+
+def normalize_money(value):
+    if not value:
+        return ""
+    value = value.replace(",", "").replace("￥", "").replace("¥", "")
+    match = re.search(r"-?\d+(?:\.\d{1,2})?", value)
+    return match.group(0) if match else ""
+
+
+def parse_invoice_items(text):
+    lines = [normalize_item_line(line) for line in text.splitlines() if line.strip()]
+    item_lines = []
+    started = False
+
+    for line in lines:
+        if re.search(r"(项目名称|货物或应税劳务|服务名称)", line):
+            started = True
+            continue
+        if started and re.search(r"(合计|价税合计|销售方|备注|收款人|复核|开票人)", line):
+            break
+        if started:
+            item_lines.append(line)
+
+    if not item_lines:
+        item_lines = [
+            line
+            for line in lines
+            if re.search(r"\d+\.\d{2}", line)
+            and not re.search(r"(价税合计|合计金额|小写|税额合计)", line)
+        ]
+
+    items = []
+    for line in item_lines:
+        if not line or len(line) < 3:
+            continue
+
+        tax_rate_match = re.search(r"(\d{1,2}%|免税|不征税|普通征税)", line)
+        tax_rate = tax_rate_match.group(1) if tax_rate_match else ""
+        money_values = [normalize_money(item) for item in re.findall(r"-?\d+(?:,\d{3})*\.\d{2}", line)]
+        money_values = [item for item in money_values if item]
+
+        if len(money_values) < 2 and not tax_rate:
+            continue
+
+        tax_amount = money_values[-1] if money_values else ""
+        amount = money_values[-2] if len(money_values) >= 2 else ""
+        unit_price = money_values[-3] if len(money_values) >= 3 else ""
+
+        prefix = line
+        for value in money_values:
+            prefix = prefix.replace(value, " ")
+        if tax_rate:
+            prefix = prefix.replace(tax_rate, " ")
+        prefix = re.sub(r"\s+", " ", prefix).strip()
+
+        parts = [part for part in re.split(r"\s+|,|，", prefix) if part]
+        project_name = parts[0] if parts else prefix
+        spec_model = parts[1] if len(parts) >= 4 else ""
+        unit = parts[2] if len(parts) >= 4 else (parts[1] if len(parts) >= 3 else "")
+        quantity = parts[3] if len(parts) >= 4 else ""
+
+        items.append(
+            {
+                "项目名称": project_name,
+                "规格型号": spec_model,
+                "单位": unit,
+                "数量": quantity,
+                "单价": unit_price,
+                "金额": amount,
+                "税率": tax_rate,
+                "税额": tax_amount,
+            }
+        )
+
+    if items:
+        return items
+
+    raw_tokens = [line for line in lines if line]
+    start_index = 0
+    for index, token in enumerate(raw_tokens):
+        if re.search(r"(项目名称|货物或应税劳务|服务名称)", token):
+            start_index = index + 1
+            break
+
+    end_index = len(raw_tokens)
+    for index, token in enumerate(raw_tokens[start_index:], start=start_index):
+        if re.search(r"(合计|价税合计|销售方|备注|收款人|复核|开票人)", token):
+            end_index = index
+            break
+    tokens = [
+        token
+        for token in raw_tokens[start_index:end_index]
+        if not re.fullmatch(
+            r"(项目名称|规格型号|单位|数量|单价|金额|税率|税额|货物或应税劳务|服务名称)",
+            token,
+        )
+    ]
+
+    def is_money_token(value):
+        return bool(re.fullmatch(r"-?\d+(?:,\d{3})*\.\d{2}", value))
+
+    def is_number_token(value):
+        return bool(re.fullmatch(r"-?\d+(?:\.\d+)?", value))
+
+    parsed_items = []
+    tax_indexes = [
+        index
+        for index, token in enumerate(tokens)
+        if re.fullmatch(r"\d{1,2}%|免税|不征税|普通征税", token)
+    ]
+
+    segment_start = 0
+    for tax_index in tax_indexes:
+        before = tokens[segment_start:tax_index]
+        after = tokens[tax_index + 1 :]
+        money_before = [item for item in before if is_money_token(item)]
+        money_after = [item for item in after if is_money_token(item)]
+        if not money_before and not money_after:
+            continue
+
+        tax_amount = normalize_money(money_after[0]) if money_after else ""
+        amount = normalize_money(money_before[-1]) if money_before else ""
+        unit_price = normalize_money(money_before[-2]) if len(money_before) >= 2 else ""
+
+        amount_index = before.index(money_before[-1]) if money_before else len(before)
+        prefix = before[:amount_index]
+        numeric_prefix = [item for item in prefix if is_number_token(item) and not is_money_token(item)]
+        quantity = numeric_prefix[-1] if numeric_prefix else ""
+        text_prefix = [item for item in prefix if not is_number_token(item) and not is_money_token(item)]
+
+        project_name = text_prefix[0] if text_prefix else ""
+        spec_model = text_prefix[1] if len(text_prefix) >= 3 else ""
+        unit = text_prefix[-1] if len(text_prefix) >= 2 else ""
+
+        parsed_items.append(
+            {
+                "项目名称": project_name,
+                "规格型号": spec_model,
+                "单位": unit,
+                "数量": quantity,
+                "单价": unit_price,
+                "金额": amount,
+                "税率": tokens[tax_index],
+                "税额": tax_amount,
+            }
+        )
+        if money_after:
+            segment_start = tax_index + 1 + after.index(money_after[0]) + 1
+
+    if parsed_items:
+        return parsed_items
+    return [{field: "" for field in ITEM_FIELDS}]
+
+
 def extract_invoice_info(text):
+    buyer = parse_party_info(text, "购买方")
+    seller = parse_party_info(text, "销售方")
     return {
         "发票号码": parse_invoice_number(text),
         "开票日期": parse_invoice_date(text),
-        "金额": parse_amount(text),
-        "销售方": parse_seller(text),
+        "价税合计": parse_amount(text),
+        **buyer,
+        **seller,
+        "项目明细": parse_invoice_items(text),
     }
 
 
 def generate_new_name(info, original_ext):
     number = clean_name(info.get("发票号码") or "未知", 24)
     date = clean_name(info.get("开票日期") or "未知", 8)
-    amount = clean_name(info.get("金额") or "未知", 14)
-    seller = clean_name(info.get("销售方") or "未知", 48)
+    amount = clean_name(info.get("价税合计") or "未知", 14)
+    seller = clean_name(info.get("销售方名称") or "未知", 48)
     base = clean_name(f"{number}_{date}_{amount}_{seller}", 180)
     return f"{base}{original_ext.lower()}"
 
 
-def get_archive_folder(info, archive_mode, custom_field=None):
+def get_archive_folder(info, archive_mode):
     if archive_mode == "不归档":
         return ""
     if archive_mode == "按月份":
         date = info.get("开票日期", "")
         return date[:6] if len(date) >= 6 else "未知月份"
     if archive_mode == "按销售方":
-        return clean_name(info.get("销售方", ""), 50)
-    if archive_mode == "自定义字段" and custom_field:
-        return clean_name(info.get(custom_field, ""), 50)
+        return clean_name(info.get("销售方名称", ""), 50)
     return ""
 
 
@@ -380,41 +644,48 @@ def make_unique_filename(folder, filename):
     return f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
 
 
-def read_image_text(reader, image, use_preprocess):
+def read_image_text(reader, image, use_preprocess, profile):
     image = ImageOps.exif_transpose(image)
     if use_preprocess:
         image = preprocess_image(image)
     else:
         image = image.convert("RGB")
-    image_np = resize_image(np.array(image), max_width=1400)
-    results = reader.readtext(image_np, detail=0, paragraph=False)
+    image_np = resize_image(np.array(image), max_width=profile["max_width"])
+    results = reader.readtext(
+        image_np,
+        detail=0,
+        paragraph=False,
+        decoder="greedy",
+        canvas_size=profile["canvas_size"],
+        mag_ratio=profile["mag_ratio"],
+    )
     return normalize_ocr_text(results)
 
 
-def ocr_file(file_bytes, filename, use_preprocess):
+def ocr_file(file_bytes, filename, use_preprocess, profile):
     reader = get_reader()
     suffix = Path(filename).suffix.lower()
 
     if suffix in SUPPORTED_EXTENSIONS - {".pdf"}:
         try:
             image = Image.open(io.BytesIO(file_bytes))
-            ocr_text = read_image_text(reader, image, use_preprocess)
+            ocr_text = read_image_text(reader, image, use_preprocess, profile)
         except Exception as exc:
             raise RuntimeError(f"图片读取或识别失败：{exc}") from exc
     elif suffix == ".pdf":
         try:
             images = convert_from_bytes(
                 file_bytes,
-                dpi=220,
+                dpi=profile["pdf_dpi"],
                 first_page=1,
-                last_page=MAX_PDF_PAGES,
+                last_page=profile["max_pdf_pages"],
             )
         except Exception as exc:
             raise RuntimeError(f"PDF 转换失败，请确认已安装 poppler：{exc}") from exc
 
         all_text = []
         for image in images:
-            all_text.append(read_image_text(reader, image, use_preprocess))
+            all_text.append(read_image_text(reader, image, use_preprocess, profile))
         ocr_text = "\n".join(item for item in all_text if item)
     else:
         raise RuntimeError("不支持的文件格式")
@@ -457,7 +728,7 @@ def render_header():
             <div class="app-kicker">Invoice OCR Workspace</div>
             <h1 class="app-title">JENNY 发票识别</h1>
             <div class="app-subtitle">
-                批量识别图片、PDF 或 ZIP 中的发票，提取号码、日期、金额和销售方，并生成可下载的归档文件。
+                批量识别图片、PDF 或 ZIP 中的发票，提取购销方、项目明细、税额和价税合计，并生成可下载的规范表格。
             </div>
         </div>
         """,
@@ -467,19 +738,24 @@ def render_header():
 
 def render_metrics(records):
     df = pd.DataFrame(records)
-    total = len(df)
-    full_hits = int((df[RESULT_REQUIRED_FIELDS] != "").all(axis=1).sum()) if total else 0
-    missing = int((df[RESULT_REQUIRED_FIELDS] == "").any(axis=1).sum()) if total else 0
-    failed = int(df["备注"].astype(str).str.contains("失败|错误", regex=True).sum()) if total else 0
-    amount_sum = pd.to_numeric(df["金额（元）"], errors="coerce").sum() if total else 0
+    total_rows = len(df)
+    invoice_count = int(df["源文件名"].nunique()) if total_rows else 0
+    missing = int((df[RESULT_REQUIRED_FIELDS] == "").any(axis=1).sum()) if total_rows else 0
+    failed = (
+        int(df["处理备注"].astype(str).str.contains("失败|错误", regex=True).sum())
+        if total_rows
+        else 0
+    )
+    amount_df = df.drop_duplicates(subset=["源文件名", "发票号码", "价税合计"])
+    amount_sum = pd.to_numeric(amount_df["价税合计"], errors="coerce").sum() if total_rows else 0
 
     st.markdown(
         f"""
         <div class="metric-strip">
-            <div class="metric-item"><div class="metric-label">处理文件</div><div class="metric-value">{total}</div></div>
-            <div class="metric-item"><div class="metric-label">完整识别</div><div class="metric-value">{full_hits}</div></div>
+            <div class="metric-item"><div class="metric-label">处理文件</div><div class="metric-value">{invoice_count}</div></div>
+            <div class="metric-item"><div class="metric-label">明细行数</div><div class="metric-value">{total_rows}</div></div>
             <div class="metric-item"><div class="metric-label">待核对</div><div class="metric-value">{missing + failed}</div></div>
-            <div class="metric-item"><div class="metric-label">金额合计</div><div class="metric-value">{amount_sum:,.2f}</div></div>
+            <div class="metric-item"><div class="metric-label">价税合计</div><div class="metric-value">{amount_sum:,.2f}</div></div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -510,8 +786,9 @@ def reset_previous_results():
     st.session_state.pop("results_ready", None)
 
 
-def process_uploads(uploaded_files, archive_mode, custom_field, use_preprocess):
+def process_uploads(uploaded_files, archive_mode, use_preprocess, ocr_profile_name):
     reset_previous_results()
+    profile = OCR_PROFILES[ocr_profile_name]
 
     to_process = []
     zip_messages = []
@@ -542,13 +819,14 @@ def process_uploads(uploaded_files, archive_mode, custom_field, use_preprocess):
         ocr_text = ""
 
         try:
-            ocr_text, info = ocr_file(file_bytes, original_name, use_preprocess)
+            ocr_text, info = ocr_file(file_bytes, original_name, use_preprocess, profile)
         except Exception as exc:
             info = {field: "" for field in INVOICE_FIELDS}
+            info["项目明细"] = [{field: "" for field in ITEM_FIELDS}]
             note = str(exc)
 
         new_name = generate_new_name(info, original_ext)
-        subfolder = get_archive_folder(info, archive_mode, custom_field)
+        subfolder = get_archive_folder(info, archive_mode)
         subfolder_clean = "" if not subfolder else clean_name(subfolder, 80)
         dest_folder = Path(temp_dir) / subfolder_clean if subfolder_clean else Path(temp_dir)
         dest_folder.mkdir(parents=True, exist_ok=True)
@@ -569,19 +847,32 @@ def process_uploads(uploaded_files, archive_mode, custom_field, use_preprocess):
         if missing_fields:
             note = f"{note}；待核对：{','.join(missing_fields)}".strip("；")
 
-        records.append(
-            {
-                "原文件名": original_name,
-                "新文件名": saved_name,
-                "归档文件夹": subfolder_clean if subfolder_clean else "根目录",
-                "发票号码": info["发票号码"],
-                "开票日期": info["开票日期"],
-                "金额（元）": info["金额"],
-                "销售方": info["销售方"],
-                "备注": note,
-                "OCR文本片段": ocr_text[:180],
-            }
-        )
+        for item in info.get("项目明细") or [{field: "" for field in ITEM_FIELDS}]:
+            records.append(
+                {
+                    "源文件名": original_name,
+                    "发票号码": info.get("发票号码", ""),
+                    "开票日期": info.get("开票日期", ""),
+                    "购买方名称": info.get("购买方名称", ""),
+                    "购买方纳税人识别号": info.get("购买方纳税人识别号", ""),
+                    "购买方地址电话": info.get("购买方地址电话", ""),
+                    "购买方开户行及账号": info.get("购买方开户行及账号", ""),
+                    "销售方名称": info.get("销售方名称", ""),
+                    "销售方纳税人识别号": info.get("销售方纳税人识别号", ""),
+                    "销售方地址电话": info.get("销售方地址电话", ""),
+                    "销售方开户行及账号": info.get("销售方开户行及账号", ""),
+                    "项目名称": item.get("项目名称", ""),
+                    "规格型号": item.get("规格型号", ""),
+                    "单位": item.get("单位", ""),
+                    "数量": item.get("数量", ""),
+                    "单价": item.get("单价", ""),
+                    "金额": item.get("金额", ""),
+                    "税率": item.get("税率", ""),
+                    "税额": item.get("税额", ""),
+                    "价税合计": info.get("价税合计", ""),
+                    "处理备注": note,
+                }
+            )
         progress_bar.progress(index / total)
 
     status_text.text("处理完成")
@@ -629,17 +920,20 @@ def main():
 
     with st.sidebar:
         st.header("处理设置")
+        ocr_profile_name = st.selectbox(
+            "识别模式",
+            list(OCR_PROFILES.keys()),
+            index=0,
+            help="快速模式适合线上批量处理；高精度会更慢，适合少量模糊发票。",
+        )
         archive_mode = st.selectbox(
             "归档方式",
-            ["不归档", "按月份", "按销售方", "自定义字段"],
+            ["不归档", "按月份", "按销售方"],
             help="识别后的文件会按所选维度放入不同文件夹。",
         )
-        custom_field = None
-        if archive_mode == "自定义字段":
-            custom_field = st.selectbox("归档字段", INVOICE_FIELDS)
         use_preprocess = st.checkbox(
             "图像增强",
-            value=True,
+            value=False,
             help="适合手机拍摄、灰底或轻微模糊的发票；清晰扫描件可关闭以加快处理。",
         )
 
@@ -665,8 +959,8 @@ def main():
             records, temp_dir, zip_messages = process_uploads(
                 uploaded_files,
                 archive_mode,
-                custom_field,
                 use_preprocess,
+                ocr_profile_name,
             )
         except Exception as exc:
             st.error(str(exc))
@@ -684,6 +978,7 @@ def main():
     if st.session_state.get("results_ready"):
         records = st.session_state["records"]
         df = pd.DataFrame(records)
+        df = df.reindex(columns=RESULT_COLUMNS, fill_value="")
         render_metrics(records)
 
         st.subheader("识别结果")
@@ -692,8 +987,10 @@ def main():
             use_container_width=True,
             hide_index=True,
             column_config={
-                "OCR文本片段": st.column_config.TextColumn(width="large"),
-                "备注": st.column_config.TextColumn(width="medium"),
+                "购买方地址电话": st.column_config.TextColumn(width="large"),
+                "购买方开户行及账号": st.column_config.TextColumn(width="large"),
+                "销售方地址电话": st.column_config.TextColumn(width="large"),
+                "销售方开户行及账号": st.column_config.TextColumn(width="large"),
             },
         )
         render_downloads(df, st.session_state["temp_dir"])
