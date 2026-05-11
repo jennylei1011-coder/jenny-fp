@@ -5,6 +5,8 @@ import re
 import os
 import tempfile
 import shutil
+import unicodedata
+import uuid
 from pathlib import Path
 from PIL import Image
 import io
@@ -17,10 +19,11 @@ import cv2
 st.set_page_config(page_title="发票识别重命名工具", layout="wide")
 st.title("📋 发票批量识别、重命名与汇总表格生成")
 st.markdown(
-    "上传发票图片或 PDF，自动提取关键信息，按规范重命名并导出表格。\n\n"
+    "上传发票图片或 PDF（或包含它们的 ZIP 压缩包），自动提取关键信息，"
+    "按规范重命名并导出表格。\n\n"
     "💡 **提示**：请尽量上传清晰的图片，避免反光、倾斜和阴影；"
     "对手机拍摄的发票，可开启「图像增强」提升识别率。\n\n"
-    "📁 **如何上传整个文件夹？** 将该文件夹压缩成 `.zip` 文件上传即可，程序会自动解压并处理其中的所有发票。"
+    "📁 **上传整个文件夹？** 请先将文件夹压缩为 `.zip` 再上传。"
 )
 
 # -------------------------- 缓存 EasyOCR Reader --------------------------
@@ -71,7 +74,33 @@ def extract_invoice_info(text):
         info["销售方"] = re.sub(r'\s+', '', name)
     return info
 
-# -------------------------- 归档文件夹名称 --------------------------
+# -------------------------- 安全名称处理 --------------------------
+def clean_name(s, max_len=60):
+    """彻底清理文件名/文件夹名中的非法字符并限制长度"""
+    if not s:
+        return "未知"
+    # Unicode 正规化，避免外观相同但编码不同的字符
+    s = unicodedata.normalize('NFKC', s)
+    # 移除控制字符和零宽字符
+    s = re.sub(r'[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202f]', '', s)
+    # 替换系统不允许的字符为下划线
+    s = re.sub(r'[\\/*?:"<>|]', '_', s)
+    # 去除首尾空白和点
+    s = s.strip().rstrip('.')
+    if not s:
+        return "未知"
+    return s[:max_len]
+
+def generate_new_name(info, original_ext):
+    number = clean_name(info.get("发票号码") or "未知", 20)
+    date = clean_name(info.get("开票日期") or "未知", 8)
+    amount = clean_name(info.get("金额") or "未知", 10)
+    seller = clean_name(info.get("销售方") or "未知", 30)
+    base = f"{number}_{date}_{amount}_{seller}"
+    base = clean_name(base, 180)  # 最终文件名限制总长度
+    return f"{base}{original_ext}"
+
+# -------------------------- 归档文件夹确定 --------------------------
 def get_archive_folder(info, archive_mode, custom_field=None):
     if archive_mode == "不归档":
         return ""
@@ -79,18 +108,16 @@ def get_archive_folder(info, archive_mode, custom_field=None):
         date = info.get("开票日期", "")
         if date and len(date) >= 6:
             return date[:6]
-        else:
-            return "未知月份"
+        return "未知月份"
     elif archive_mode == "按销售方":
         seller = info.get("销售方", "")
-        return seller if seller else "未知销售方"
+        return clean_name(seller, 50) if seller else "未知销售方"
     elif archive_mode == "自定义字段" and custom_field:
         value = info.get(custom_field, "")
-        return value if value else f"未知{custom_field}"
-    else:
-        return ""
+        return clean_name(value, 50) if value else f"未知{custom_field}"
+    return ""
 
-# -------------------------- 文件 OCR 处理 --------------------------
+# -------------------------- 处理单个文件 --------------------------
 def ocr_file(file_bytes, filename, use_preprocess):
     reader = get_reader()
     suffix = Path(filename).suffix.lower()
@@ -117,72 +144,44 @@ def ocr_file(file_bytes, filename, use_preprocess):
             all_text.extend(results)
         ocr_text = " ".join(all_text)
     else:
-        st.warning(f"暂不支持的文件类型: {suffix}")
         return "", {}
     info = extract_invoice_info(ocr_text)
     return ocr_text, info
 
-# -------------------------- 安全文件名/文件夹名 --------------------------
-def safe_name(s):
-    s = re.sub(r'[\\/*?:"<>|]', '', s)
-    s = s.strip().rstrip('.')
-    return s if s else "未知"
-
-def generate_new_name(info, original_ext):
-    number = info.get("发票号码") or "未知"
-    date = info.get("开票日期") or "未知"
-    amount = info.get("金额") or "未知"
-    seller = info.get("销售方") or "未知"
-    base = f"{number}_{date}_{amount}_{seller}"
-    base = safe_name(base)
-    return f"{base}{original_ext}"
-
 # -------------------------- 从 ZIP 中提取文件 --------------------------
 def extract_files_from_zip(zip_bytes):
-    """返回 [(file_bytes, filename), ...] 仅包含支持的图片和 PDF"""
     supported_ext = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.pdf'}
     files = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        for info in zf.infolist():
-            if info.is_dir():
+        for member in zf.infolist():
+            if member.is_dir():
                 continue
-            ext = Path(info.filename).suffix.lower()
+            ext = Path(member.filename).suffix.lower()
             if ext in supported_ext:
-                # 读取文件内容
-                file_data = zf.read(info)
-                # 仅使用文件名部分，避免 ZIP 内路径干扰
-                filename = Path(info.filename).name
-                files.append((file_data, filename))
+                data = zf.read(member)
+                # 仅使用文件名，忽略 ZIP 内的路径
+                fname = Path(member.filename).name
+                files.append((data, fname))
     return files
 
 # -------------------------- 主界面 --------------------------
 def main():
     with st.sidebar:
-        st.header("⚙️ 归档设置")
+        st.header("⚙️ 设置")
         archive_mode = st.selectbox(
-            "选择归档方式",
+            "归档方式",
             ["不归档", "按月份", "按销售方", "自定义字段"],
-            index=0,
-            help="重命名后的文件将按所选维度放入不同的文件夹中。"
+            help="重命名后的文件将按所选维度放入不同文件夹。"
         )
         custom_field = None
         if archive_mode == "自定义字段":
             field_options = ["发票号码", "开票日期", "金额", "销售方"]
-            custom_field = st.selectbox(
-                "选择用于归档的字段",
-                field_options,
-                help="将根据该字段的值创建文件夹（如有缺失则归入‘未知’文件夹）。"
-            )
-        use_preprocess = st.checkbox(
-            "🛠️ 启用图像增强",
-            value=True,
-            help="开启后会对图片进行二值化处理，可能提升手机拍照/扫描件的识别率。"
-        )
+            custom_field = st.selectbox("选择归档字段", field_options)
+        use_preprocess = st.checkbox("🛠️ 启用图像增强", value=True,
+                                     help="对手机拍摄或扫描件进行二值化，可能提高识别率。")
 
-    # ---------- 文件上传 ----------
     uploaded_files = st.file_uploader(
-        "📤 选择发票文件（可多选，支持 JPG/PNG/PDF/BMP/TIFF/ZIP）\n"
-        "💡 上传整个文件夹？请先压缩成 .zip 再上传",
+        "📤 选择发票文件（可多选，支持 JPG/PNG/PDF/BMP/TIFF/ZIP）",
         type=["png", "jpg", "jpeg", "pdf", "bmp", "tiff", "tif", "zip"],
         accept_multiple_files=True
     )
@@ -192,24 +191,23 @@ def main():
             progress_bar = st.progress(0)
             status_text = st.empty()
 
-            # ---------- 构建待处理文件列表 ----------
-            to_process = []  # 每个元素: (file_bytes, original_filename)
+            # ---------- 准备待处理列表 ----------
+            to_process = []
             for uf in uploaded_files:
                 name = uf.name
                 data = uf.read()
                 if name.lower().endswith('.zip'):
-                    # 解压 ZIP，取出支持的发票文件
                     extracted = extract_files_from_zip(data)
-                    if not extracted:
-                        st.warning(f"ZIP 文件 `{name}` 中未找到支持的发票文件。")
-                    else:
+                    if extracted:
                         st.info(f"已从 `{name}` 中提取 {len(extracted)} 个文件")
-                    to_process.extend(extracted)
+                        to_process.extend(extracted)
+                    else:
+                        st.warning(f"ZIP 文件 `{name}` 中未找到支持的发票文件。")
                 else:
                     to_process.append((data, name))
 
             if not to_process:
-                st.error("没有可处理的发票文件，请上传 JPG/PNG/PDF 或包含它们的 ZIP。")
+                st.error("没有可处理的发票文件。")
                 st.stop()
 
             total = len(to_process)
@@ -226,64 +224,75 @@ def main():
                 # 生成新文件名
                 new_name = generate_new_name(info, original_ext)
 
-                # 确定归档文件夹
+                # 确定归档子文件夹（清理后）
                 subfolder = get_archive_folder(info, archive_mode, custom_field)
-                subfolder = safe_name(subfolder) if subfolder else ""
+                subfolder_clean = clean_name(subfolder, 80) if subfolder else ""
+                dest_folder = os.path.join(temp_dir, subfolder_clean) if subfolder_clean else temp_dir
 
-                # 在临时目录创建子文件夹并保存
-                dest_folder = os.path.join(temp_dir, subfolder) if subfolder else temp_dir
-                if subfolder and not os.path.exists(dest_folder):
-                    os.makedirs(dest_folder, exist_ok=True)
-                new_path = os.path.join(dest_folder, new_name)
-                with open(new_path, "wb") as f:
-                    f.write(file_bytes)
+                # 确保文件夹存在
+                os.makedirs(dest_folder, exist_ok=True)
 
+                # ---------- 安全保存文件 ----------
+                saved_path = None
+                save_note = ""
+                try:
+                    new_path = os.path.join(dest_folder, new_name)
+                    with open(new_path, "wb") as f:
+                        f.write(file_bytes)
+                    saved_path = new_name
+                except Exception as e:
+                    # 如果第一次保存失败（路径/文件名问题），使用 UUID 短名兜底
+                    fallback_name = f"invoice_{uuid.uuid4().hex[:8]}{original_ext}"
+                    fallback_path = os.path.join(dest_folder, fallback_name)
+                    try:
+                        with open(fallback_path, "wb") as f:
+                            f.write(file_bytes)
+                        saved_path = fallback_name
+                        save_note = f"文件名无效已重命名，原错误：{e}"
+                    except Exception as e2:
+                        save_note = f"保存失败：{e2}"
+                        saved_path = "保存失败"
+
+                # 记录汇总
                 records.append({
                     "原文件名": original_name,
-                    "新文件名": new_name,
-                    "归档文件夹": subfolder if subfolder else "根目录",
+                    "新文件名": saved_path,
+                    "归档文件夹": subfolder_clean if subfolder_clean else "根目录",
                     "发票号码": info["发票号码"],
                     "开票日期": info["开票日期"],
                     "金额（元）": info["金额"],
                     "销售方": info["销售方"],
+                    "备注": save_note,
                     "OCR文本片段": ocr_text[:150]
                 })
 
                 progress_bar.progress((idx + 1) / total)
 
             status_text.text("✅ 处理完成！")
-            st.success(f"共处理 {total} 个文件，结果如下：")
+            st.success(f"共处理 {total} 个文件")
 
-            # ---------- 汇总表 ----------
+            # ---------- 显示汇总表 ----------
             st.subheader("📊 提取结果汇总")
             df = pd.DataFrame(records)
             st.dataframe(df, use_container_width=True)
 
-            # ---------- 下载 ----------
+            # ---------- 下载按钮 ----------
             col1, col2 = st.columns(2)
             with col1:
                 csv = df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button(
-                    label="📥 下载汇总表格 (CSV)",
-                    data=csv,
-                    file_name="发票汇总.csv",
-                    mime="text/csv"
-                )
+                st.download_button("📥 下载汇总表格 (CSV)", data=csv,
+                                   file_name="发票汇总.csv", mime="text/csv")
             with col2:
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                     for root, _, files in os.walk(temp_dir):
                         for file in files:
-                            full_path = os.path.join(root, file)
-                            arcname = os.path.relpath(full_path, temp_dir)
-                            zf.write(full_path, arcname)
+                            full = os.path.join(root, file)
+                            arcname = os.path.relpath(full, temp_dir)
+                            zf.write(full, arcname)
                 zip_buffer.seek(0)
-                st.download_button(
-                    label="📦 下载全部文件 (ZIP)",
-                    data=zip_buffer,
-                    file_name="归档发票.zip",
-                    mime="application/zip"
-                )
+                st.download_button("📦 下载全部文件 (ZIP)", data=zip_buffer,
+                                   file_name="归档发票.zip", mime="application/zip")
 
             shutil.rmtree(temp_dir, ignore_errors=True)
 
