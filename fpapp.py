@@ -17,9 +17,10 @@ import cv2
 st.set_page_config(page_title="发票识别重命名工具", layout="wide")
 st.title("📋 发票批量识别、重命名与汇总表格生成")
 st.markdown(
-    "上传发票图片或 PDF，自动提取关键信息，按规范重命名并导出表格。"
-    "\n\n💡 **提示**：请尽量上传清晰的图片，避免反光、倾斜和阴影；"
-    "对手机拍摄的发票，可开启「图像增强」提升识别率。"
+    "上传发票图片或 PDF，自动提取关键信息，按规范重命名并导出表格。\n\n"
+    "💡 **提示**：请尽量上传清晰的图片，避免反光、倾斜和阴影；"
+    "对手机拍摄的发票，可开启「图像增强」提升识别率。\n\n"
+    "📁 **如何上传整个文件夹？** 将该文件夹压缩成 `.zip` 文件上传即可，程序会自动解压并处理其中的所有发票。"
 )
 
 # -------------------------- 缓存 EasyOCR Reader --------------------------
@@ -70,19 +71,14 @@ def extract_invoice_info(text):
         info["销售方"] = re.sub(r'\s+', '', name)
     return info
 
-# -------------------------- 确定归档子文件夹名称 --------------------------
+# -------------------------- 归档文件夹名称 --------------------------
 def get_archive_folder(info, archive_mode, custom_field=None):
-    """
-    根据归档模式返回文件夹名称字符串。
-    archive_mode: "不归档" / "按月份" / "按销售方" / "自定义字段"
-    """
     if archive_mode == "不归档":
-        return ""  # 直接放在根目录
+        return ""
     elif archive_mode == "按月份":
         date = info.get("开票日期", "")
         if date and len(date) >= 6:
-            year_month = date[:6]  # 如 202301
-            return year_month
+            return date[:6]
         else:
             return "未知月份"
     elif archive_mode == "按销售方":
@@ -128,8 +124,8 @@ def ocr_file(file_bytes, filename, use_preprocess):
 
 # -------------------------- 安全文件名/文件夹名 --------------------------
 def safe_name(s):
-    s = re.sub(r'[\\/*?:"<>|]', '', s)  # 移除非法字符
-    s = s.strip().rstrip('.')  # 末尾不能是点
+    s = re.sub(r'[\\/*?:"<>|]', '', s)
+    s = s.strip().rstrip('.')
     return s if s else "未知"
 
 def generate_new_name(info, original_ext):
@@ -141,9 +137,26 @@ def generate_new_name(info, original_ext):
     base = safe_name(base)
     return f"{base}{original_ext}"
 
+# -------------------------- 从 ZIP 中提取文件 --------------------------
+def extract_files_from_zip(zip_bytes):
+    """返回 [(file_bytes, filename), ...] 仅包含支持的图片和 PDF"""
+    supported_ext = {'.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.pdf'}
+    files = []
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            ext = Path(info.filename).suffix.lower()
+            if ext in supported_ext:
+                # 读取文件内容
+                file_data = zf.read(info)
+                # 仅使用文件名部分，避免 ZIP 内路径干扰
+                filename = Path(info.filename).name
+                files.append((file_data, filename))
+    return files
+
 # -------------------------- 主界面 --------------------------
 def main():
-    # ---------- 左侧边栏：归档设置 ----------
     with st.sidebar:
         st.header("⚙️ 归档设置")
         archive_mode = st.selectbox(
@@ -166,10 +179,11 @@ def main():
             help="开启后会对图片进行二值化处理，可能提升手机拍照/扫描件的识别率。"
         )
 
-    # ---------- 主区域 ----------
+    # ---------- 文件上传 ----------
     uploaded_files = st.file_uploader(
-        "📤 选择发票文件（可多选，支持 JPG/PNG/PDF/BMP/TIFF）",
-        type=["png", "jpg", "jpeg", "pdf", "bmp", "tiff", "tif"],
+        "📤 选择发票文件（可多选，支持 JPG/PNG/PDF/BMP/TIFF/ZIP）\n"
+        "💡 上传整个文件夹？请先压缩成 .zip 再上传",
+        type=["png", "jpg", "jpeg", "pdf", "bmp", "tiff", "tif", "zip"],
         accept_multiple_files=True
     )
 
@@ -177,15 +191,33 @@ def main():
         if st.button("🚀 开始识别并处理", type="primary"):
             progress_bar = st.progress(0)
             status_text = st.empty()
+
+            # ---------- 构建待处理文件列表 ----------
+            to_process = []  # 每个元素: (file_bytes, original_filename)
+            for uf in uploaded_files:
+                name = uf.name
+                data = uf.read()
+                if name.lower().endswith('.zip'):
+                    # 解压 ZIP，取出支持的发票文件
+                    extracted = extract_files_from_zip(data)
+                    if not extracted:
+                        st.warning(f"ZIP 文件 `{name}` 中未找到支持的发票文件。")
+                    else:
+                        st.info(f"已从 `{name}` 中提取 {len(extracted)} 个文件")
+                    to_process.extend(extracted)
+                else:
+                    to_process.append((data, name))
+
+            if not to_process:
+                st.error("没有可处理的发票文件，请上传 JPG/PNG/PDF 或包含它们的 ZIP。")
+                st.stop()
+
+            total = len(to_process)
             records = []
             temp_dir = tempfile.mkdtemp()
-            total = len(uploaded_files)
 
-            for idx, uploaded_file in enumerate(uploaded_files):
-                status_text.text(f"正在处理: {uploaded_file.name} ({idx+1}/{total})")
-
-                file_bytes = uploaded_file.read()
-                original_name = uploaded_file.name
+            for idx, (file_bytes, original_name) in enumerate(to_process):
+                status_text.text(f"正在处理: {original_name} ({idx+1}/{total})")
                 original_ext = Path(original_name).suffix
 
                 # OCR + 提取信息
@@ -198,7 +230,7 @@ def main():
                 subfolder = get_archive_folder(info, archive_mode, custom_field)
                 subfolder = safe_name(subfolder) if subfolder else ""
 
-                # 在临时目录创建对应的子文件夹（如果有）
+                # 在临时目录创建子文件夹并保存
                 dest_folder = os.path.join(temp_dir, subfolder) if subfolder else temp_dir
                 if subfolder and not os.path.exists(dest_folder):
                     os.makedirs(dest_folder, exist_ok=True)
@@ -206,7 +238,6 @@ def main():
                 with open(new_path, "wb") as f:
                     f.write(file_bytes)
 
-                # 记录到汇总表
                 records.append({
                     "原文件名": original_name,
                     "新文件名": new_name,
@@ -239,13 +270,11 @@ def main():
                     mime="text/csv"
                 )
             with col2:
-                # 打包成 ZIP，保留文件夹结构
                 zip_buffer = io.BytesIO()
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                     for root, _, files in os.walk(temp_dir):
                         for file in files:
                             full_path = os.path.join(root, file)
-                            # arcname 是 ZIP 内的相对路径
                             arcname = os.path.relpath(full_path, temp_dir)
                             zf.write(full_path, arcname)
                 zip_buffer.seek(0)
@@ -256,7 +285,6 @@ def main():
                     mime="application/zip"
                 )
 
-            # 清理临时目录
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 if __name__ == "__main__":
