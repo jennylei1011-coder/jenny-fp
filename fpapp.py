@@ -66,16 +66,16 @@ OCR_PROFILES = {
         "mag_ratio": 0.9,
     },
     "均衡": {
-        "max_width": 1200,
+        "max_width": 1400,
         "pdf_dpi": 180,
-        "max_pdf_pages": 3,
-        "canvas_size": 1800,
+        "max_pdf_pages": 1,
+        "canvas_size": 2048,
         "mag_ratio": 1.0,
     },
     "高精度": {
         "max_width": 1600,
         "pdf_dpi": 220,
-        "max_pdf_pages": 8,
+        "max_pdf_pages": 3,
         "canvas_size": 2560,
         "mag_ratio": 1.1,
     },
@@ -272,6 +272,66 @@ def normalize_ocr_text(results):
     return "\n".join(lines)
 
 
+def get_box_metrics(box):
+    xs = [point[0] for point in box]
+    ys = [point[1] for point in box]
+    return {
+        "x1": min(xs),
+        "x2": max(xs),
+        "y1": min(ys),
+        "y2": max(ys),
+        "cx": sum(xs) / len(xs),
+        "cy": sum(ys) / len(ys),
+        "height": max(ys) - min(ys),
+    }
+
+
+def build_text_from_ocr_results(results):
+    entries = []
+    for result in results:
+        if len(result) < 2:
+            continue
+        box, text = result[0], str(result[1]).strip()
+        if not text:
+            continue
+        metrics = get_box_metrics(box)
+        entries.append({**metrics, "text": text})
+
+    if not entries:
+        return ""
+
+    entries.sort(key=lambda item: (item["cy"], item["x1"]))
+    rows = []
+    for entry in entries:
+        placed = False
+        for row in rows:
+            tolerance = max(10, row["height"] * 0.65, entry["height"] * 0.65)
+            if abs(entry["cy"] - row["cy"]) <= tolerance:
+                row["items"].append(entry)
+                row["cy"] = sum(item["cy"] for item in row["items"]) / len(row["items"])
+                row["height"] = max(row["height"], entry["height"])
+                placed = True
+                break
+        if not placed:
+            rows.append({"cy": entry["cy"], "height": entry["height"], "items": [entry]})
+
+    lines = []
+    for row in sorted(rows, key=lambda item: item["cy"]):
+        items = sorted(row["items"], key=lambda item: item["x1"])
+        line_parts = []
+        previous_x2 = None
+        median_height = max(1, row["height"])
+        for item in items:
+            if previous_x2 is not None and item["x1"] - previous_x2 > median_height * 0.9:
+                line_parts.append(" ")
+            line_parts.append(item["text"])
+            previous_x2 = item["x2"]
+        line = normalize_item_line(" ".join(line_parts))
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def clean_extracted_value(value):
     value = unicodedata.normalize("NFKC", value or "")
     value = re.sub(r"[ \t\r\f\v]+", "", value)
@@ -393,6 +453,8 @@ def parse_labeled_value(section, label_patterns, max_len=120):
 
 
 def parse_party_info(text, role):
+    compact_lines = [clean_extracted_value(line) for line in text.splitlines() if line.strip()]
+    compact_text = "\n".join(compact_lines)
     if role == "购买方":
         section = parse_party_section(
             text,
@@ -407,6 +469,11 @@ def parse_party_info(text, role):
         )
 
     name = parse_labeled_value(section, [r"名称", r"名\s*称"], 90)
+    all_names = [
+        trim_company_name(item)
+        for item in re.findall(r"(?:名称|名\s*称)[:：]?([^\n]{2,90})", compact_text)
+    ]
+    all_names = [item for item in all_names if item]
     if not name:
         company_match = re.search(
             r"([^\n]{2,90}?(?:有限责任公司|股份有限公司|有限公司|公司|事务所|集团|中心|厂|店))",
@@ -414,15 +481,20 @@ def parse_party_info(text, role):
         )
         if company_match:
             name = company_match.group(1)
+    if not name and all_names:
+        name = all_names[0] if role == "购买方" else all_names[-1]
 
     tax_id = parse_labeled_value(
         section,
         [r"纳税人识别号", r"统一社会信用代码", r"税号", r"识别号"],
         80,
     )
+    all_tax_ids = re.findall(r"\b([0-9A-Z]{15,20})\b", clean_extracted_value(compact_text))
     if not tax_id:
         tax_match = re.search(r"\b([0-9A-Z]{15,20})\b", clean_extracted_value(section))
         tax_id = tax_match.group(1) if tax_match else ""
+    if not tax_id and all_tax_ids:
+        tax_id = all_tax_ids[0] if role == "购买方" else all_tax_ids[-1]
 
     address_phone = parse_labeled_value(section, [r"地址、电话", r"地址电话", r"地址"], 120)
     bank_account = parse_labeled_value(
@@ -653,13 +725,13 @@ def read_image_text(reader, image, use_preprocess, profile):
     image_np = resize_image(np.array(image), max_width=profile["max_width"])
     results = reader.readtext(
         image_np,
-        detail=0,
+        detail=1,
         paragraph=False,
         decoder="greedy",
         canvas_size=profile["canvas_size"],
         mag_ratio=profile["mag_ratio"],
     )
-    return normalize_ocr_text(results)
+    return build_text_from_ocr_results(results)
 
 
 def ocr_file(file_bytes, filename, use_preprocess, profile):
@@ -918,23 +990,55 @@ def main():
     apply_custom_styles()
     render_header()
 
+    if "saved_settings" not in st.session_state:
+        st.session_state["saved_settings"] = {
+            "ocr_profile_name": "均衡",
+            "archive_mode": "不归档",
+            "use_preprocess": False,
+        }
+    saved_settings = st.session_state["saved_settings"]
+    if saved_settings.get("ocr_profile_name") not in OCR_PROFILES:
+        saved_settings["ocr_profile_name"] = "均衡"
+    if saved_settings.get("archive_mode") not in ["不归档", "按月份", "按销售方"]:
+        saved_settings["archive_mode"] = "不归档"
+    saved_settings["use_preprocess"] = bool(saved_settings.get("use_preprocess", False))
+
     with st.sidebar:
         st.header("处理设置")
-        ocr_profile_name = st.selectbox(
-            "识别模式",
-            list(OCR_PROFILES.keys()),
-            index=0,
-            help="快速模式适合线上批量处理；高精度会更慢，适合少量模糊发票。",
-        )
-        archive_mode = st.selectbox(
-            "归档方式",
-            ["不归档", "按月份", "按销售方"],
-            help="识别后的文件会按所选维度放入不同文件夹。",
-        )
-        use_preprocess = st.checkbox(
-            "图像增强",
-            value=False,
-            help="适合手机拍摄、灰底或轻微模糊的发票；清晰扫描件可关闭以加快处理。",
+        profile_names = list(OCR_PROFILES.keys())
+        archive_modes = ["不归档", "按月份", "按销售方"]
+
+        with st.form("settings_form"):
+            draft_profile = st.selectbox(
+                "识别模式",
+                profile_names,
+                index=profile_names.index(saved_settings["ocr_profile_name"]),
+                help="均衡模式更适合发票明细；快速模式更快但可能降低准确率。",
+            )
+            draft_archive_mode = st.selectbox(
+                "归档方式",
+                archive_modes,
+                index=archive_modes.index(saved_settings["archive_mode"]),
+                help="识别后的文件会按所选维度放入不同文件夹。",
+            )
+            draft_use_preprocess = st.checkbox(
+                "图像增强",
+                value=saved_settings["use_preprocess"],
+                help="适合手机拍摄、灰底或轻微模糊的发票；清晰扫描件可关闭以加快处理。",
+            )
+            if st.form_submit_button("保存设置", use_container_width=True):
+                st.session_state["saved_settings"] = {
+                    "ocr_profile_name": draft_profile,
+                    "archive_mode": draft_archive_mode,
+                    "use_preprocess": draft_use_preprocess,
+                }
+                saved_settings = st.session_state["saved_settings"]
+                st.success("设置已保存")
+
+        st.caption(
+            f"当前使用：{saved_settings['ocr_profile_name']}｜"
+            f"{saved_settings['archive_mode']}｜"
+            f"{'图像增强' if saved_settings['use_preprocess'] else '不增强'}"
         )
 
     uploaded_files = st.file_uploader(
@@ -958,9 +1062,9 @@ def main():
         try:
             records, temp_dir, zip_messages = process_uploads(
                 uploaded_files,
-                archive_mode,
-                use_preprocess,
-                ocr_profile_name,
+                saved_settings["archive_mode"],
+                saved_settings["use_preprocess"],
+                saved_settings["ocr_profile_name"],
             )
         except Exception as exc:
             st.error(str(exc))
