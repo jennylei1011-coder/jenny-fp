@@ -1,4 +1,5 @@
 streamlit
+mineru[core]
 easyocr
 pandas
 openpyxl
