@@ -1,9 +1,15 @@
 import io
+import json
 import os
 import re
 import shutil
+import socket
+import subprocess
 import tempfile
+import time
 import unicodedata
+import urllib.error
+import urllib.request
 import uuid
 import zipfile
 from datetime import datetime
@@ -35,6 +41,7 @@ INVOICE_FIELDS = [
 ]
 RESULT_REQUIRED_FIELDS = ["发票号码", "开票日期", "销售方名称", "价税合计"]
 RESULT_COLUMNS = [
+    "源文件名",
     "发票号码",
     "开票日期",
     "购买方名称",
@@ -54,6 +61,8 @@ RESULT_COLUMNS = [
     "税率",
     "税额",
     "价税合计",
+    "识别引擎",
+    "处理备注",
 ]
 MAX_ZIP_FILES = 300
 MAX_ZIP_TOTAL_SIZE = 800 * 1024 * 1024
@@ -79,6 +88,33 @@ OCR_PROFILES = {
         "canvas_size": 2560,
         "mag_ratio": 1.1,
     },
+}
+OCR_ENGINES = {
+    "MINERU 优先": "mineru_first",
+    "仅 MINERU": "mineru_only",
+    "EasyOCR 快速": "easyocr",
+}
+MINERU_TEXT_KEYS = {
+    "content",
+    "equation",
+    "html",
+    "image_caption",
+    "image_footnote",
+    "img_caption",
+    "img_footnote",
+    "latex",
+    "table_body",
+    "table_caption",
+    "table_footnote",
+    "text",
+    "text_content",
+    "title",
+}
+MINERU_SKIP_KEYS = {
+    "image_path",
+    "img_path",
+    "path",
+    "res_path",
 }
 
 
@@ -286,7 +322,7 @@ def get_box_metrics(box):
     }
 
 
-def build_text_from_ocr_results(results):
+def ocr_results_to_entries(results, y_offset=0):
     entries = []
     for result in results:
         if len(result) < 2:
@@ -295,8 +331,14 @@ def build_text_from_ocr_results(results):
         if not text:
             continue
         metrics = get_box_metrics(box)
+        metrics["y1"] += y_offset
+        metrics["y2"] += y_offset
+        metrics["cy"] += y_offset
         entries.append({**metrics, "text": text})
+    return entries
 
+
+def build_text_from_entries(entries):
     if not entries:
         return ""
 
@@ -332,11 +374,20 @@ def build_text_from_ocr_results(results):
     return "\n".join(lines)
 
 
+def build_text_from_ocr_results(results):
+    return build_text_from_entries(ocr_results_to_entries(results))
+
+
 def clean_extracted_value(value):
     value = unicodedata.normalize("NFKC", value or "")
     value = re.sub(r"[ \t\r\f\v]+", "", value)
     value = re.sub(r"[|｜]+", "", value)
     return value.strip(" :：,，.;；")
+
+
+def normalize_match_text(value):
+    value = clean_extracted_value(value)
+    return re.sub(r"[\s:：,，.。;；()（）\[\]【】]", "", value)
 
 
 def normalize_item_line(value):
@@ -450,6 +501,143 @@ def parse_labeled_value(section, label_patterns, max_len=120):
                 if index + 1 < len(section_lines):
                     return clean_extracted_value(section_lines[index + 1])[:max_len]
     return ""
+
+
+def group_entries_by_row(entries):
+    rows = []
+    for entry in sorted(entries, key=lambda item: (item["cy"], item["x1"])):
+        placed = False
+        for row in rows:
+            tolerance = max(8, row["height"] * 0.7, entry["height"] * 0.7)
+            if abs(entry["cy"] - row["cy"]) <= tolerance:
+                row["items"].append(entry)
+                row["cy"] = sum(item["cy"] for item in row["items"]) / len(row["items"])
+                row["height"] = max(row["height"], entry["height"])
+                placed = True
+                break
+        if not placed:
+            rows.append({"cy": entry["cy"], "height": entry["height"], "items": [entry]})
+
+    for row in rows:
+        row["items"].sort(key=lambda item: item["x1"])
+        row["text"] = normalize_item_line(" ".join(item["text"] for item in row["items"]))
+    return sorted(rows, key=lambda item: item["cy"])
+
+
+def entry_matches(entry, keywords):
+    text = normalize_match_text(entry["text"])
+    return any(keyword in text for keyword in keywords)
+
+
+def find_first_entry(entries, keywords):
+    for entry in sorted(entries, key=lambda item: (item["cy"], item["x1"])):
+        if entry_matches(entry, keywords):
+            return entry
+    return None
+
+
+def strip_label_from_value(value, labels):
+    value = normalize_item_line(value)
+    for label in labels:
+        value = re.sub(label, "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^(名称|名\s*称|纳税人识别号|统一社会信用代码|税号|识别号|地址、电话|地址电话|地址|开户行及账号|开户行及帐号|开户银行及账号|开户行账号)[:：]?", "", value)
+    return normalize_item_line(value)
+
+
+def value_near_label(section_entries, label_keywords, stop_keywords=None):
+    stop_keywords = stop_keywords or ["名称", "纳税人识别号", "统一社会信用代码", "地址", "电话", "开户行", "账号"]
+    labels = [
+        entry
+        for entry in section_entries
+        if entry_matches(entry, label_keywords)
+    ]
+    if not labels:
+        return ""
+
+    for label in sorted(labels, key=lambda item: (item["cy"], item["x1"])):
+        own_text = strip_label_from_value(label["text"], label_keywords)
+        if own_text and normalize_match_text(own_text) not in label_keywords:
+            return own_text
+
+        same_row = [
+            entry
+            for entry in section_entries
+            if entry is not label
+            and abs(entry["cy"] - label["cy"]) <= max(10, label["height"] * 0.9)
+            and entry["x1"] > label["x2"] - 4
+        ]
+        values = []
+        for entry in sorted(same_row, key=lambda item: item["x1"]):
+            if entry_matches(entry, stop_keywords):
+                break
+            values.append(entry["text"])
+        if values:
+            return normalize_item_line(" ".join(values))
+
+        below = [
+            entry
+            for entry in section_entries
+            if label["cy"] < entry["cy"] <= label["cy"] + max(42, label["height"] * 3.2)
+            and entry["x1"] >= label["x1"] - 8
+        ]
+        if below:
+            row = group_entries_by_row(below)[0]
+            return normalize_item_line(row["text"])
+    return ""
+
+
+def parse_party_info_from_entries(entries, role):
+    if not entries:
+        return {}
+
+    buyer_marker = find_first_entry(entries, ["购买方", "购货方", "付款方"])
+    seller_marker = find_first_entry(entries, ["销售方", "销货方", "收款方", "销售单位"])
+    item_marker = find_first_entry(entries, ["项目名称", "货物或应税劳务", "服务名称"])
+    total_marker = find_first_entry(entries, ["价税合计"])
+
+    if role == "购买方":
+        start_y = buyer_marker["y1"] - 10 if buyer_marker else 0
+        end_candidates = [
+            marker["y1"]
+            for marker in [seller_marker, item_marker]
+            if marker and marker["y1"] > start_y
+        ]
+        end_y = min(end_candidates) if end_candidates else float("inf")
+    else:
+        start_y = seller_marker["y1"] - 10 if seller_marker else (
+            item_marker["y2"] if item_marker else 0
+        )
+        end_candidates = [
+            marker["y1"]
+            for marker in [total_marker]
+            if marker and marker["y1"] > start_y
+        ]
+        end_y = min(end_candidates) if end_candidates else float("inf")
+
+    section_entries = [
+        entry
+        for entry in entries
+        if start_y <= entry["cy"] <= end_y
+    ]
+    if not section_entries:
+        return {}
+
+    name = value_near_label(section_entries, ["名称", "名称"])
+    tax_id = value_near_label(section_entries, ["纳税人识别号", "统一社会信用代码", "税号", "识别号"])
+    address_phone = value_near_label(section_entries, ["地址电话", "地址", "电话"])
+    bank_account = value_near_label(section_entries, ["开户行及账号", "开户行及帐号", "开户银行及账号", "开户行", "账号"])
+
+    if not tax_id:
+        section_text = clean_extracted_value("".join(entry["text"] for entry in section_entries))
+        tax_match = re.search(r"\b([0-9A-Z]{15,20})\b", section_text)
+        tax_id = tax_match.group(1) if tax_match else ""
+
+    return {
+        f"{role}名称": trim_company_name(name),
+        f"{role}纳税人识别号": clean_name(tax_id, 30) if tax_id else "",
+        f"{role}地址电话": address_phone,
+        f"{role}开户行及账号": bank_account,
+    }
 
 
 def parse_party_info(text, role):
@@ -716,6 +904,187 @@ def make_unique_filename(folder, filename):
     return f"{stem}_{uuid.uuid4().hex[:8]}{suffix}"
 
 
+def strip_markup(value):
+    value = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", value)
+    value = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", value)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def collect_mineru_text(data, parent_key=""):
+    lines = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if key in MINERU_SKIP_KEYS:
+                continue
+            if isinstance(value, str):
+                cleaned = strip_markup(value)
+                if cleaned and (key in MINERU_TEXT_KEYS or parent_key in MINERU_TEXT_KEYS):
+                    lines.append(cleaned)
+                continue
+            lines.extend(collect_mineru_text(value, key))
+    elif isinstance(data, list):
+        for item in data:
+            lines.extend(collect_mineru_text(item, parent_key))
+    return lines
+
+
+def read_text_file(path):
+    for encoding in ("utf-8", "utf-8-sig", "gb18030"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def extract_mineru_output_text(output_dir):
+    content_files = sorted(
+        output_dir.rglob("*content_list*.json"),
+        key=lambda item: item.stat().st_size,
+        reverse=True,
+    )
+    for content_file in content_files:
+        try:
+            data = json.loads(read_text_file(content_file))
+        except Exception:
+            continue
+        lines = collect_mineru_text(data)
+        text = "\n".join(line for line in lines if line)
+        if text.strip():
+            return text
+
+    markdown_files = sorted(
+        output_dir.rglob("*.md"),
+        key=lambda item: item.stat().st_size,
+        reverse=True,
+    )
+    for markdown_file in markdown_files:
+        text = "\n".join(
+            strip_markup(line)
+            for line in read_text_file(markdown_file).splitlines()
+            if strip_markup(line)
+        )
+        if text.strip():
+            return text
+
+    return ""
+
+
+def is_http_ready(url, timeout=1.5):
+    base_url = url.rstrip("/")
+    for target in (base_url, f"{base_url}/docs", f"{base_url}/openapi.json"):
+        try:
+            with urllib.request.urlopen(target, timeout=timeout) as response:
+                return response.status < 500
+        except urllib.error.HTTPError as exc:
+            if exc.code < 500:
+                return True
+        except (OSError, urllib.error.URLError):
+            continue
+    return False
+
+
+def find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(("127.0.0.1", 0))
+        return server.getsockname()[1]
+
+
+@st.cache_resource(show_spinner="正在启动 MINERU 高精度识别服务...")
+def get_mineru_api_service():
+    configured_url = os.environ.get("MINERU_API_URL", "").strip().rstrip("/")
+    if configured_url:
+        return (configured_url, None) if is_http_ready(configured_url) else ("", None)
+
+    mineru_api_command = shutil.which("mineru-api")
+    if not mineru_api_command:
+        return "", None
+
+    try:
+        port = int(os.environ.get("MINERU_API_PORT") or find_free_port())
+    except ValueError:
+        port = find_free_port()
+    api_url = f"http://127.0.0.1:{port}"
+    process = subprocess.Popen(
+        [
+            mineru_api_command,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        if process.poll() is not None:
+            return "", None
+        if is_http_ready(api_url):
+            return api_url, process
+        time.sleep(1)
+
+    process.terminate()
+    return "", None
+
+
+def read_text_with_mineru(file_bytes, filename, profile):
+    mineru_command = shutil.which("mineru")
+    if not mineru_command:
+        raise RuntimeError("未找到 MINERU 命令，请先安装依赖并确保 mineru 在 PATH 中")
+
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        raise RuntimeError("不支持的文件格式")
+
+    with tempfile.TemporaryDirectory(prefix="mineru_invoice_") as work_dir:
+        work_path = Path(work_dir)
+        input_path = work_path / clean_name(filename, 120)
+        output_path = work_path / "output"
+        input_path.write_bytes(file_bytes)
+
+        command = [
+            mineru_command,
+            "-p",
+            str(input_path),
+            "-o",
+            str(output_path),
+            "-b",
+            "pipeline",
+            "-m",
+            "auto",
+            "-l",
+            "ch",
+            "--formula",
+            "false",
+        ]
+        api_url, _ = get_mineru_api_service()
+        if api_url:
+            command.extend(["--api-url", api_url])
+        if suffix == ".pdf":
+            command.extend(["-s", "0", "-e", str(max(0, profile["max_pdf_pages"] - 1))])
+        env = os.environ.copy()
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            env=env,
+            text=True,
+            timeout=max(300, profile["max_pdf_pages"] * 180),
+        )
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "").strip()
+            raise RuntimeError(f"MINERU 识别失败：{detail[:500] or '未知错误'}")
+
+        text = extract_mineru_output_text(output_path)
+        if not text:
+            raise RuntimeError("MINERU 未输出可解析文本")
+        return text
+
+
 def read_image_text(reader, image, use_preprocess, profile):
     image = ImageOps.exif_transpose(image)
     if use_preprocess:
@@ -734,7 +1103,7 @@ def read_image_text(reader, image, use_preprocess, profile):
     return build_text_from_ocr_results(results)
 
 
-def ocr_file(file_bytes, filename, use_preprocess, profile):
+def read_text_with_easyocr(file_bytes, filename, use_preprocess, profile):
     reader = get_reader()
     suffix = Path(filename).suffix.lower()
 
@@ -762,7 +1131,25 @@ def ocr_file(file_bytes, filename, use_preprocess, profile):
     else:
         raise RuntimeError("不支持的文件格式")
 
-    return ocr_text, extract_invoice_info(ocr_text)
+    return ocr_text
+
+
+def ocr_file(file_bytes, filename, use_preprocess, profile, ocr_engine):
+    engine_code = OCR_ENGINES.get(ocr_engine, "mineru_first")
+    mineru_error = ""
+
+    if engine_code in {"mineru_first", "mineru_only"}:
+        try:
+            ocr_text = read_text_with_mineru(file_bytes, filename, profile)
+            return ocr_text, extract_invoice_info(ocr_text), "MINERU", ""
+        except Exception as exc:
+            mineru_error = str(exc)
+            if engine_code == "mineru_only":
+                raise
+
+    ocr_text = read_text_with_easyocr(file_bytes, filename, use_preprocess, profile)
+    note = f"MINERU 不可用，已自动改用 EasyOCR：{mineru_error}" if mineru_error else ""
+    return ocr_text, extract_invoice_info(ocr_text), "EasyOCR", note
 
 
 def extract_files_from_zip(zip_bytes):
@@ -858,7 +1245,7 @@ def reset_previous_results():
     st.session_state.pop("results_ready", None)
 
 
-def process_uploads(uploaded_files, archive_mode, use_preprocess, ocr_profile_name):
+def process_uploads(uploaded_files, archive_mode, use_preprocess, ocr_profile_name, ocr_engine):
     reset_previous_results()
     profile = OCR_PROFILES[ocr_profile_name]
 
@@ -889,9 +1276,17 @@ def process_uploads(uploaded_files, archive_mode, use_preprocess, ocr_profile_na
         original_ext = Path(original_name).suffix.lower()
         note = ""
         ocr_text = ""
+        engine_used = ""
 
         try:
-            ocr_text, info = ocr_file(file_bytes, original_name, use_preprocess, profile)
+            ocr_text, info, engine_used, engine_note = ocr_file(
+                file_bytes,
+                original_name,
+                use_preprocess,
+                profile,
+                ocr_engine,
+            )
+            note = engine_note
         except Exception as exc:
             info = {field: "" for field in INVOICE_FIELDS}
             info["项目明细"] = [{field: "" for field in ITEM_FIELDS}]
@@ -942,6 +1337,7 @@ def process_uploads(uploaded_files, archive_mode, use_preprocess, ocr_profile_na
                     "税率": item.get("税率", ""),
                     "税额": item.get("税额", ""),
                     "价税合计": info.get("价税合计", ""),
+                    "识别引擎": engine_used,
                     "处理备注": note,
                 }
             )
@@ -992,11 +1388,14 @@ def main():
 
     if "saved_settings" not in st.session_state:
         st.session_state["saved_settings"] = {
+            "ocr_engine": "MINERU 优先",
             "ocr_profile_name": "均衡",
             "archive_mode": "不归档",
             "use_preprocess": False,
         }
     saved_settings = st.session_state["saved_settings"]
+    if saved_settings.get("ocr_engine") not in OCR_ENGINES:
+        saved_settings["ocr_engine"] = "MINERU 优先"
     if saved_settings.get("ocr_profile_name") not in OCR_PROFILES:
         saved_settings["ocr_profile_name"] = "均衡"
     if saved_settings.get("archive_mode") not in ["不归档", "按月份", "按销售方"]:
@@ -1006,9 +1405,16 @@ def main():
     with st.sidebar:
         st.header("处理设置")
         profile_names = list(OCR_PROFILES.keys())
+        engine_names = list(OCR_ENGINES.keys())
         archive_modes = ["不归档", "按月份", "按销售方"]
 
         with st.form("settings_form"):
+            draft_engine = st.selectbox(
+                "识别引擎",
+                engine_names,
+                index=engine_names.index(saved_settings["ocr_engine"]),
+                help="MINERU 优先会先用 MINERU 做高精度版面识别；未安装或失败时自动改用 EasyOCR。",
+            )
             draft_profile = st.selectbox(
                 "识别模式",
                 profile_names,
@@ -1028,6 +1434,7 @@ def main():
             )
             if st.form_submit_button("保存设置", use_container_width=True):
                 st.session_state["saved_settings"] = {
+                    "ocr_engine": draft_engine,
                     "ocr_profile_name": draft_profile,
                     "archive_mode": draft_archive_mode,
                     "use_preprocess": draft_use_preprocess,
@@ -1036,7 +1443,8 @@ def main():
                 st.success("设置已保存")
 
         st.caption(
-            f"当前使用：{saved_settings['ocr_profile_name']}｜"
+            f"当前使用：{saved_settings['ocr_engine']}｜"
+            f"{saved_settings['ocr_profile_name']}｜"
             f"{saved_settings['archive_mode']}｜"
             f"{'图像增强' if saved_settings['use_preprocess'] else '不增强'}"
         )
@@ -1065,6 +1473,7 @@ def main():
                 saved_settings["archive_mode"],
                 saved_settings["use_preprocess"],
                 saved_settings["ocr_profile_name"],
+                saved_settings["ocr_engine"],
             )
         except Exception as exc:
             st.error(str(exc))
